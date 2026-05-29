@@ -4,8 +4,10 @@ import base64
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Iterator
+from queue import Empty, Queue
+from typing import Any, Callable, Iterable, Iterator
 
 import tiktoken
 
@@ -714,93 +716,140 @@ def stream_codex_image_outputs(
     raise ImageGenerationError("No image result found in response")
 
 
+def stream_one_image_output_with_pool(
+    request: ConversationRequest,
+    index: int,
+    total: int,
+    emit_progress: Callable[[ImageOutput], None] | None = None,
+) -> list[ImageOutput]:
+    plan_type, _ = split_image_model(request.model)
+    codex_model = is_codex_image_model(request.model)
+    while True:
+        try:
+            token = account_service.get_available_access_token(
+                plan_type=plan_type,
+                source_type="codex" if codex_model else None,
+                plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
+            )
+        except RuntimeError as exc:
+            raise ImageGenerationError(str(exc) or "image generation failed") from exc
+
+        outputs: list[ImageOutput] = []
+        emitted_for_token = False
+        returned_message = False
+        returned_result = False
+        account = account_service.get_account(token) or {}
+        account_email = str(account.get("email") or "").strip()
+        try:
+            backend = OpenAIBackendAPI(access_token=token)
+            stream_fn = stream_codex_image_outputs if codex_model else stream_image_outputs
+            for output in stream_fn(backend, request, index, total):
+                if account_email and not output.account_email:
+                    output.account_email = account_email
+                if output.kind == "message" and request.message_as_error:
+                    raise ImageGenerationError(
+                        output.text or "Image generation was rejected by upstream policy.",
+                        status_code=400,
+                        error_type="invalid_request_error",
+                        code="content_policy_violation",
+                        account_email=account_email,
+                    )
+                if output.kind == "progress" and emit_progress:
+                    emit_progress(output)
+                outputs.append(output)
+                emitted_for_token = True
+                returned_message = returned_message or output.kind == "message"
+                returned_result = returned_result or output.kind == "result"
+            if returned_message or not returned_result:
+                account_service.mark_image_result(token, False)
+                return outputs
+            account_service.mark_image_result(token, True)
+            return outputs
+        except ImagePollTimeoutError as exc:
+            if account_email and not getattr(exc, "account_email", ""):
+                exc.account_email = account_email
+            raise
+        except ImageGenerationError as exc:
+            account_service.mark_image_result(token, False)
+            if account_email and not getattr(exc, "account_email", ""):
+                exc.account_email = account_email
+            logger.warning({
+                "event": "image_stream_generation_error",
+                "request_token": token,
+                "account_email": account_email,
+                "error": str(exc),
+            })
+            raise
+        except Exception as exc:
+            account_service.mark_image_result(token, False)
+            error_message = str(exc)
+            logger.warning({
+                "event": "image_stream_fail",
+                "request_token": token,
+                "account_email": account_email,
+                "error": error_message,
+            })
+            if not emitted_for_token and is_token_invalid_error(error_message):
+                refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
+                if refreshed_token and refreshed_token != token:
+                    token = refreshed_token
+                    continue
+                account_service.remove_invalid_token(token, "image_stream")
+                continue
+            raise ImageGenerationError(image_stream_error_message(error_message), account_email=account_email) from exc
+
+
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
     if not is_supported_image_model(request.model):
         raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
 
-    emitted = False
-    last_error = ""
-    for index in range(1, request.n + 1):
-        while True:
-            try:
-                plan_type, _ = split_image_model(request.model)
-                codex_model = is_codex_image_model(request.model)
-                token = account_service.get_available_access_token(
-                    plan_type=plan_type,
-                    source_type="codex" if codex_model else None,
-                    plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
-                )
-            except RuntimeError as exc:
-                if emitted:
-                    return
-                raise ImageGenerationError(str(exc) or "image generation failed") from exc
+    completed: dict[int, list[ImageOutput]] = {}
+    errors: list[ImageGenerationError] = []
+    total = max(1, int(request.n or 1))
+    progress_queue: Queue[ImageOutput] = Queue()
+    with ThreadPoolExecutor(max_workers=total) as executor:
+        futures = {
+            executor.submit(stream_one_image_output_with_pool, request, index, total, progress_queue.put): index
+            for index in range(1, total + 1)
+        }
+        pending = dict(futures)
+        while pending:
+            while True:
+                try:
+                    yield progress_queue.get_nowait()
+                except Empty:
+                    break
 
-            emitted_for_token = False
-            returned_message = False
-            returned_result = False
-            account = account_service.get_account(token) or {}
-            account_email = str(account.get("email") or "").strip()
-            try:
-                backend = OpenAIBackendAPI(access_token=token)
-                stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
-                for output in stream_fn(backend, request, index, request.n):
-                    if account_email and not output.account_email:
-                        output.account_email = account_email
-                    if output.kind == "message" and request.message_as_error:
-                        raise ImageGenerationError(
-                            output.text or "Image generation was rejected by upstream policy.",
-                            status_code=400,
-                            error_type="invalid_request_error",
-                            code="content_policy_violation",
-                            account_email=account_email,
-                        )
-                    emitted = True
-                    emitted_for_token = True
-                    returned_message = output.kind == "message"
-                    returned_result = returned_result or output.kind == "result"
-                    yield output
-                if returned_message or not returned_result:
-                    account_service.mark_image_result(token, False)
-                    return
-                account_service.mark_image_result(token, True)
-                break
-            except ImagePollTimeoutError as exc:
-                if account_email and not getattr(exc, "account_email", ""):
-                    exc.account_email = account_email
-                raise
-            except ImageGenerationError as exc:
-                account_service.mark_image_result(token, False)
-                if account_email and not getattr(exc, "account_email", ""):
-                    exc.account_email = account_email
-                logger.warning({
-                    "event": "image_stream_generation_error",
-                    "request_token": token,
-                    "account_email": account_email,
-                    "error": str(exc),
-                })
-                raise
-            except Exception as exc:
-                account_service.mark_image_result(token, False)
-                last_error = str(exc)
-                logger.warning({
-                    "event": "image_stream_fail",
-                    "request_token": token,
-                    "account_email": account_email,
-                    "error": last_error,
-                })
-                if not emitted_for_token and is_token_invalid_error(last_error):
-                    refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
-                    if refreshed_token and refreshed_token != token:
-                        token = refreshed_token
-                        continue
-                    account_service.remove_invalid_token(token, "image_stream")
-                    continue
-                raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email) from exc
+            done = [future for future in pending if future.done()]
+            if not done:
+                try:
+                    yield progress_queue.get(timeout=0.1)
+                except Empty:
+                    pass
+                continue
 
-    if not emitted:
-        if not last_error:
-            last_error = "no account in the pool could generate images — check account quota and rate-limit status"
-        raise ImageGenerationError(image_stream_error_message(last_error))
+            for future in done:
+                index = pending.pop(future)
+                try:
+                    completed[index] = future.result()
+                except ImagePollTimeoutError:
+                    raise
+                except ImageGenerationError as exc:
+                    errors.append(exc)
+
+    while True:
+        try:
+            yield progress_queue.get_nowait()
+        except Empty:
+            break
+
+    if errors:
+        raise errors[0]
+
+    for index in sorted(completed):
+        for output in completed[index]:
+            if output.kind != "progress":
+                yield output
 
 
 def stream_image_chunks(outputs: Iterable[ImageOutput]) -> Iterator[dict[str, Any]]:
