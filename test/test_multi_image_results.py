@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import base64
+import json
 import unittest
 from unittest import mock
 
 from services.config import config
 from services.openai_backend_api import OpenAIBackendAPI
-from services.protocol.conversation import ImageOutput, extract_conversation_ids
+from services.protocol.conversation import (
+    ConversationRequest,
+    ImageOutput,
+    collect_image_outputs,
+    extract_conversation_ids,
+    stream_image_outputs,
+)
 from services.protocol.openai_v1_response import stream_image_response
 
 
@@ -47,6 +54,64 @@ class FakeBackend(OpenAIBackendAPI):
 
     def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
         return self.sediment_urls.get(attachment_id, "")
+
+
+class ContinuationBackend(OpenAIBackendAPI):
+    def __init__(self) -> None:
+        self.continued = False
+        self.followup_prompt = ""
+
+    def stream_conversation(self, **_kwargs):
+        yield json.dumps({
+            "type": "server_ste_metadata",
+            "conversation_id": "conv-1",
+            "metadata": {"tool_invoked": False, "turn_use_case": "image gen"},
+        })
+        yield json.dumps({
+            "conversation_id": "conv-1",
+            "p": "/message/content/parts/0",
+            "o": "append",
+            "v": '{"size":"1792x1024","n":1}',
+        })
+        yield "[DONE]"
+
+    def get_image_conversation_debug_snapshot(self, conversation_id: str) -> dict:
+        return {
+            "conversation_id": conversation_id,
+            "current_node": "assistant-1",
+            "parent_message_id": "assistant-1",
+            "messages": [{"message_id": "assistant-1", "role": "assistant", "text_preview": '{"size":"1792x1024","n":1}'}],
+        }
+
+    def continue_image_conversation(self, conversation_id: str, parent_message_id: str, prompt: str, model: str):
+        self.continued = True
+        self.followup_prompt = prompt
+        self.assert_values = (conversation_id, parent_message_id, model)
+        yield json.dumps({
+            "type": "server_ste_metadata",
+            "conversation_id": "conv-1",
+            "metadata": {"tool_invoked": True, "turn_use_case": "image gen"},
+        })
+        yield json.dumps({
+            "conversation_id": "conv-1",
+            "v": {
+                "message": {
+                    "author": {"role": "tool"},
+                    "metadata": {"async_task_type": "image_gen"},
+                    "content": {
+                        "content_type": "multimodal_text",
+                        "parts": [{"content_type": "image_asset_pointer", "asset_pointer": "file-service://file-out"}],
+                    },
+                },
+            },
+        })
+        yield "[DONE]"
+
+    def resolve_conversation_image_urls(self, conversation_id: str, file_ids: list[str], sediment_ids: list[str], poll: bool = True) -> list[str]:
+        return ["https://files.test/out.png"] if conversation_id == "conv-1" and file_ids == ["file-out"] else []
+
+    def download_image_bytes(self, urls: list[str]) -> list[bytes]:
+        return [b"out"] if urls == ["https://files.test/out.png"] else []
 
 
 class MultiImageResultTests(unittest.TestCase):
@@ -153,6 +218,29 @@ class MultiImageResultTests(unittest.TestCase):
             urls = backend.resolve_conversation_image_urls("conv-1", ["file-one"], [], poll=True)
 
         self.assertEqual(urls, ["https://files.test/one.png"])
+
+    def test_tool_argument_text_continues_same_conversation(self) -> None:
+        backend = ContinuationBackend()
+
+        outputs = list(stream_image_outputs(
+            backend,
+            ConversationRequest(
+                prompt="把截图改成详情页",
+                model="gpt-image-2",
+                images=["input-image"],
+                response_format="b64_json",
+            ),
+        ))
+        result = collect_image_outputs(outputs)
+
+        self.assertTrue(backend.continued)
+        self.assertIn("不要输出 JSON", backend.followup_prompt)
+        self.assertEqual(len(result["data"]), 1)
+        context = result["_upstream_context"]
+        self.assertEqual(context["conversation_id"], "conv-1")
+        self.assertEqual(context["continuation"]["status"], "success")
+        self.assertEqual(context["continuation"]["parent_message_id"], "assistant-1")
+        self.assertEqual(context["continuation"]["after_stream"]["file_ids"], ["file-out"])
 
     def test_responses_stream_emits_all_image_output_items(self) -> None:
         first = base64.b64encode(b"first").decode("ascii")

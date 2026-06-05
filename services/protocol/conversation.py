@@ -6,7 +6,8 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Iterator
+from queue import Empty, Queue
+from typing import Any, Callable, Iterable, Iterator
 
 import tiktoken
 
@@ -23,6 +24,12 @@ from utils.helper import (
 )
 from utils.image_tokens import count_image_content_tokens
 from utils.log import logger
+
+NON_OUTPUT_IMAGE_FILE_IDS = {
+    "file_upload",
+    "file_upload_business_upsell",
+    "file_upload_business_upsell_get_business",
+}
 
 
 class ImageGenerationError(Exception):
@@ -222,6 +229,37 @@ def build_image_prompt(prompt: str, size: str | None, quality: str = "auto") -> 
     return f"{prompt.strip()}\n\n{''.join(hints)}" if hints else prompt
 
 
+def parse_image_tool_arguments(text: str) -> dict[str, Any] | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if not ({"prompt", "size", "n", "referenced_image_ids", "is_style_transfer"} & set(payload)):
+        return None
+    if isinstance(payload.get("error"), (str, dict, list)):
+        return None
+    return payload
+
+
+def image_continuation_prompt(original_prompt: str, tool_arguments: dict[str, Any]) -> str:
+    args_preview = json.dumps(tool_arguments, ensure_ascii=False)[:1000]
+    return (
+        "你刚才只返回了图片工具参数 JSON，没有生成图片。"
+        "请基于本会话中已经上传的参考图和原始需求，立即调用图片生成工具生成最终图片。"
+        "不要输出 JSON、参数、解释或文字说明，只生成图片。\n\n"
+        f"原始需求：{original_prompt.strip()}\n\n"
+        f"刚才错误返回的参数：{args_preview}"
+    )
+
+
 def encoding_for_model(model: str):
     try:
         return tiktoken.encoding_for_model(model)
@@ -331,6 +369,7 @@ class ImageOutput:
     data: list[dict[str, Any]] = field(default_factory=list)
     account_email: str = ""
     conversation_id: str = ""
+    upstream_context: dict[str, Any] = field(default_factory=dict)
 
     def to_chunk(self) -> dict[str, Any]:
         chunk: dict[str, Any] = {
@@ -803,6 +842,16 @@ def stream_image_outputs(
     file_ids = [str(item) for item in last.get("file_ids") or []]
     sediment_ids = [str(item) for item in last.get("sediment_ids") or []]
     message = str(last.get("text") or "").strip()
+    upstream_context = {
+        "conversation_id": conversation_id,
+        "file_ids": file_ids,
+        "sediment_ids": sediment_ids,
+        "tool_invoked": last.get("tool_invoked"),
+        "turn_use_case": last.get("turn_use_case"),
+        "blocked": last.get("blocked"),
+    }
+    if message:
+        upstream_context["message_preview"] = message[:1000]
     logger.info({
         "event": "image_stream_resolve_start",
         "conversation_id": conversation_id,
@@ -1535,10 +1584,13 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
     message = ""
     progress_parts: list[str] = []
     account_email = ""
+    upstream_context: dict[str, Any] = {}
     for output in outputs:
         created = created or output.created
         if output.account_email and not account_email:
             account_email = output.account_email
+        if output.upstream_context:
+            upstream_context = output.upstream_context
         if output.kind == "progress" and output.text:
             progress_parts.append(output.text)
         elif output.kind == "message":
@@ -1553,4 +1605,6 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
             result["message"] = text
     if account_email:
         result["_account_email"] = account_email
+    if upstream_context:
+        result["_upstream_context"] = upstream_context
     return result
