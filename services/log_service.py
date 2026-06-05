@@ -244,9 +244,7 @@ class LoggedCall:
 
         if isinstance(result, dict):
             self.log("调用完成", result)
-            response = dict(result)
-            response.pop("_account_email", None)
-            return response
+            return _strip_internal_response_fields(result)
 
         sender = anthropic_sse_stream if sse == "anthropic" else sse_json_stream
         try:
@@ -300,7 +298,8 @@ class LoggedCall:
                          conversation_id=conversation_ids[0] if conversation_ids else "")
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
-            urls: list[str] | None = None, account_email: str = "", conversation_id: str = "") -> None:
+            urls: list[str] | None = None, account_email: str = "", conversation_id: str = "",
+            upstream_context: dict[str, Any] | None = None) -> None:
         detail = {
             "key_id": self.identity.get("id"),
             "key_name": self.identity.get("name"),
@@ -319,6 +318,10 @@ class LoggedCall:
             detail["request_shape"] = self.request_shape
         if error:
             detail["error"] = error
+        if upstream_context is None:
+            upstream_context = _collect_upstream_context(result)
+        if upstream_context:
+            detail["upstream_context"] = upstream_context
         email = str(account_email or "").strip()
         if not email:
             emails = _collect_account_emails(result)

@@ -62,6 +62,11 @@ SEARCH_POLL_INTERVAL_SECS = 3.0
 SEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion"}
 SEARCH_CONVERSATION_ID_RE = re.compile(r'"conversation_id"\s*:\s*"([^"]+)"')
 SEARCH_URL_RE = re.compile(r"https?://[^\s\"'<>）)\]}]+")
+NON_OUTPUT_IMAGE_FILE_IDS = {
+    "file_upload",
+    "file_upload_business_upsell",
+    "file_upload_business_upsell_get_business",
+}
 EDITABLE_FILE_MODEL = "gpt-5-5-thinking"
 EDITABLE_FILE_THINKING_EFFORT = "extended"
 EDITABLE_FILE_TIMEOUT_SECS = 1200.0
@@ -802,13 +807,20 @@ class OpenAIBackendAPI:
             retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
             raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
 
-    def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
+    def _prepare_image_conversation(
+            self,
+            prompt: str,
+            requirements: ChatRequirements,
+            model: str,
+            conversation_id: str = "",
+            parent_message_id: str = "",
+    ) -> str:
         """为图片生成准备 conduit token。"""
         path = "/backend-api/f/conversation/prepare"
         payload = {
             "action": "next",
             "fork_from_shared_post": False,
-            "parent_message_id": new_uuid(),
+            "parent_message_id": parent_message_id or new_uuid(),
             "model": self._image_model_slug(model),
             "client_prepare_state": "success",
             "timezone_offset_min": -480,
@@ -824,6 +836,8 @@ class OpenAIBackendAPI:
             "supported_encodings": ["v1"],
             "client_contextual_info": {"app_name": "chatgpt.com"},
         }
+        if conversation_id:
+            payload["conversation_id"] = conversation_id
         response = self.session.post(
             self.base_url + path,
             headers=self._image_headers(path, requirements),
@@ -907,8 +921,16 @@ class OpenAIBackendAPI:
             "height": height,
         }
 
-    def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
-                                references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
+    def _start_image_generation(
+            self,
+            prompt: str,
+            requirements: ChatRequirements,
+            conduit_token: str,
+            model: str,
+            references: Optional[list[Dict[str, Any]]] = None,
+            conversation_id: str = "",
+            parent_message_id: str = "",
+    ) -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
         references = references or []
         parts = [{
@@ -946,7 +968,7 @@ class OpenAIBackendAPI:
                 "content": content,
                 "metadata": metadata,
             }],
-            "parent_message_id": new_uuid(),
+            "parent_message_id": parent_message_id or new_uuid(),
             "model": self._image_model_slug(model),
             "client_prepare_state": "sent",
             "timezone_offset_min": -480,
@@ -969,6 +991,8 @@ class OpenAIBackendAPI:
             "paragen_cot_summary_display_override": "allow",
             "force_parallel_switch": "auto",
         }
+        if conversation_id:
+            payload["conversation_id"] = conversation_id
         path = "/backend-api/f/conversation"
         response = self.session.post(
             self.base_url + path,
@@ -979,6 +1003,41 @@ class OpenAIBackendAPI:
         )
         ensure_ok(response, path)
         return response
+
+    def continue_image_conversation(
+            self,
+            conversation_id: str,
+            parent_message_id: str,
+            prompt: str,
+            model: str,
+    ) -> Iterator[str]:
+        """在已有图片会话里追加一条消息，用于上游只返回工具参数时兜底续生成。"""
+        if not conversation_id:
+            raise ValueError("conversation_id is required")
+        if not parent_message_id:
+            raise ValueError("parent_message_id is required")
+        self._bootstrap()
+        requirements = self._get_chat_requirements()
+        conduit_token = self._prepare_image_conversation(
+            prompt,
+            requirements,
+            model,
+            conversation_id=conversation_id,
+            parent_message_id=parent_message_id,
+        )
+        response = self._start_image_generation(
+            prompt,
+            requirements,
+            conduit_token,
+            model,
+            references=[],
+            conversation_id=conversation_id,
+            parent_message_id=parent_message_id,
+        )
+        try:
+            yield from iter_sse_payloads(response)
+        finally:
+            response.close()
 
     def _get_conversation(self, conversation_id: str) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
@@ -1075,6 +1134,73 @@ class OpenAIBackendAPI:
                 })
                 return conv_id
         return ""
+
+    @staticmethod
+    def _conversation_text_preview(message: Dict[str, Any], limit: int = 500) -> str:
+        content = message.get("content") or {}
+        parts: list[str] = []
+        if isinstance(content, dict):
+            for part in content.get("parts") or []:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict):
+                    text = part.get("text") or part.get("summary") or part.get("content")
+                    if text:
+                        parts.append(str(text))
+        elif isinstance(content, str):
+            parts.append(content)
+        text = " ".join(" ".join(parts).split())
+        return text if len(text) <= limit else text[:limit].rstrip() + "..."
+
+    def _conversation_parent_message_id(self, conversation: Dict[str, Any]) -> str:
+        mapping = conversation.get("mapping") if isinstance(conversation.get("mapping"), dict) else {}
+        current_node = str(conversation.get("current_node") or "").strip()
+        if current_node and current_node in mapping:
+            return current_node
+        candidates: list[tuple[float, str]] = []
+        for node_id, node in mapping.items():
+            message = (node or {}).get("message") or {}
+            if not isinstance(message, dict):
+                continue
+            message_id = str(message.get("id") or node_id or "").strip()
+            if message_id:
+                candidates.append((float(message.get("create_time") or 0.0), message_id))
+        return max(candidates, default=(0.0, ""))[1]
+
+    def _image_conversation_debug_snapshot(self, conversation_id: str, conversation: Dict[str, Any]) -> Dict[str, Any]:
+        mapping = conversation.get("mapping") if isinstance(conversation.get("mapping"), dict) else {}
+        messages: list[Dict[str, Any]] = []
+        for node_id, node in mapping.items():
+            message = (node or {}).get("message") or {}
+            if not isinstance(message, dict):
+                continue
+            author = message.get("author") if isinstance(message.get("author"), dict) else {}
+            metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+            content = message.get("content") if isinstance(message.get("content"), dict) else {}
+            file_ids, sediment_ids = self._extract_image_reference_ids({"content": content, "metadata": metadata})
+            messages.append({
+                "node_id": str(node_id),
+                "message_id": str(message.get("id") or node_id or ""),
+                "role": str(author.get("role") or ""),
+                "status": str(message.get("status") or ""),
+                "content_type": str(content.get("content_type") or ""),
+                "async_task_type": str(metadata.get("async_task_type") or ""),
+                "create_time": float(message.get("create_time") or 0.0),
+                "text_preview": self._conversation_text_preview(message),
+                "file_ids": [item for item in file_ids if item not in NON_OUTPUT_IMAGE_FILE_IDS],
+                "sediment_ids": sediment_ids,
+            })
+        messages.sort(key=lambda item: item["create_time"])
+        return {
+            "conversation_id": conversation_id,
+            "current_node": str(conversation.get("current_node") or ""),
+            "parent_message_id": self._conversation_parent_message_id(conversation),
+            "messages": messages[-12:],
+        }
+
+    def get_image_conversation_debug_snapshot(self, conversation_id: str) -> Dict[str, Any]:
+        """返回可写入调用日志的上游图片会话摘要，不包含图片二进制或 token。"""
+        return self._image_conversation_debug_snapshot(conversation_id, self._get_conversation(conversation_id))
 
     @staticmethod
     def _editable_prompt(fixed_prompt: str, user_prompt_text: str) -> str:
@@ -2326,7 +2452,7 @@ class OpenAIBackendAPI:
     def _resolve_image_urls(self, conversation_id: str, file_ids: list[str], sediment_ids: list[str]) -> list[str]:
         """把图片结果 id 解析成可下载 URL。"""
         urls = []
-        skip_patterns = {"file_upload"}
+        skip_patterns = NON_OUTPUT_IMAGE_FILE_IDS
         for file_id in file_ids:
             if file_id in skip_patterns:
                 logger.debug({
@@ -2405,7 +2531,7 @@ class OpenAIBackendAPI:
             poll: bool = True,
             poll_timeout_secs: float | None = None,
     ) -> list[str]:
-        file_ids = [item for item in file_ids if item != "file_upload"]
+        file_ids = [item for item in file_ids if item not in NON_OUTPUT_IMAGE_FILE_IDS]
         sediment_ids = list(sediment_ids)
         timeout = poll_timeout_secs if poll_timeout_secs is not None else config.image_poll_timeout_secs
         # 当 check-before-hit 和 settle 均已关闭，且 SSE 已给出 file_ids 时，
